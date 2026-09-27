@@ -1,0 +1,8 @@
+fastapi==0.141.1
+uvicorn[standard]
+chromadb==1.5.9
+sentence-transformers==5.7.0
+openai
+pandas
+python-multipart
+pydantic-settings

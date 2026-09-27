@@ -1,0 +1,26 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /app/data/sales.db
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - chroma
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+  chroma:
+    image: chromadb/chroma:1.5.9
+    expose:
+      - "8000"
+    volumes:
+      - ./data/chroma:/data
