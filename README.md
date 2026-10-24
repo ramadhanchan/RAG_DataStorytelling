@@ -158,10 +158,4 @@ curl -X POST http://localhost:8000/api/chat \
 - `transformed_best_selling_books.csv` adalah dataset mentah untuk diunggah ulang.
 - `data/chroma/` adalah indeks vektor yang dibuat otomatis saat upload, tidak disertakan di repo.
 
-## Kontributor
 
-<a href="https://github.com/ramadhanchan">
-  <img src="https://github.com/ramadhanchan.png" width="80" alt="ramadhanchan" />
-</a>
-
-**ramadhanchan** — [github.com/ramadhanchan](https://github.com/ramadhanchan)
