@@ -6,9 +6,9 @@ Aplikasi ini menggabungkan **retrieval hybrid** (pencarian kata kunci di SQLite 
 
 ## Demo
 
-<video src="./ragbaru.mp4" controls width="100%"></video>
+[![Demo aplikasi RAG Data Storytelling](demo.webp)](ragbaru.mp4)
 
-Jika video tidak tampil langsung di halaman ini, buka file [`ragbaru.mp4`](./ragbaru.mp4).
+Video lengkap (78 detik): [`ragbaru.mp4`](./ragbaru.mp4)
 
 ## Fitur
 
