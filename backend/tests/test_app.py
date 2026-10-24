@@ -100,6 +100,7 @@ class TestIntegrationViaClient:
         """Test client yang tidak menimpa database production."""
         monkeypatch.setattr(settings, "database_path", TEST_DB)
         monkeypatch.setattr(settings, "deepseek_api_key", "")
+        monkeypatch.setattr(settings, "vector_enabled", False)
         return TestClient(main.app)
 
     def test_template_download(self, client):
@@ -160,3 +161,44 @@ class TestIntegrationViaClient:
     def test_health(self, client):
         resp = client.get("/health")
         assert resp.json() == {"status": "ok"}
+
+    def test_chat_no_match_returns_no_match_mode(self, client):
+        client.post("/api/upload/csv", files={"file": ("sample.csv", TestIntegrationViaClient.sample_csv, "text/csv")})
+        response = client.post("/api/chat", json={"message": "zzqxwv aneh banget ya", "session_id": "no-match"})
+        data = response.json()
+        assert response.status_code == 200
+        assert data["mode"] == "no-match"
+        assert data["sources"] == []
+
+    def test_chat_multi_turn_history_recorded(self, client):
+        client.post("/api/upload/csv", files={"file": ("sample.csv", TestIntegrationViaClient.sample_csv, "text/csv")})
+        client.post("/api/chat", json={"message": "Laskar Pelangi", "session_id": "multi-turn"})
+        resp = client.get("/api/sessions/multi-turn/history")
+        roles = [turn["role"] for turn in resp.json()]
+        assert roles == ["user", "assistant"]
+
+
+class TestGuardrails:
+    def test_valid_chart_accepts_numeric(self):
+        from app.api import _valid_chart
+        assert _valid_chart({"type": "bar", "labels": ["a", "b"], "datasets": [{"data": [1, 2]}]})
+
+    def test_valid_chart_rejects_mismatched_length(self):
+        from app.api import _valid_chart
+        assert not _valid_chart({"type": "bar", "labels": ["a", "b"], "datasets": [{"data": [1]}]})
+
+    def test_valid_chart_rejects_non_numeric(self):
+        from app.api import _valid_chart
+        assert not _valid_chart({"type": "line", "labels": ["a"], "datasets": [{"data": ["tiga"]}]})
+        assert not _valid_chart({"type": "pie", "labels": ["a"], "datasets": [{"data": [-5]}]})
+
+    def test_valid_chart_rejects_unknown_type(self):
+        from app.api import _valid_chart
+        assert not _valid_chart({"type": "radar", "labels": ["a"], "datasets": [{"data": [1]}]})
+
+    def test_prompt_includes_history_and_guardrail(self):
+        from app.prompts import SYSTEM_PROMPT, build_prompt
+        prompt = build_prompt("mana?", "ctx", {}, [{"role": "user", "content": "halo"}, {"role": "assistant", "content": "hai"}])
+        assert "RIWAYAT PERCAKAPAN" in prompt
+        assert "halo" in prompt and "hai" in prompt
+        assert "mengarang" in SYSTEM_PROMPT

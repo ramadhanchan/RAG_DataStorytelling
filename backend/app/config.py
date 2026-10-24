@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     database_path: str = "data/sales.db"
     chroma_host: str = "chroma"
     chroma_port: int = 8000
+    vector_enabled: bool = True
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-v4-pro"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"

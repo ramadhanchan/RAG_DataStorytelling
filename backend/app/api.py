@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -11,6 +12,8 @@ from .domain import REQUIRED_COLUMNS
 from .prompts import build_prompt
 from .schemas import ChatRequest, ChatResponse
 from .vector import index_rows
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SESSIONS: dict[str, tuple[datetime, list[dict]]] = {}
@@ -68,7 +71,23 @@ def ingests():
 
 _STOP_WORDS = {"apa", "yang", "paling", "laris", "berapa", "bagaimana", "tren", "bandingkan", "genre", "buku", "dari", "dan", "di", "ke", "dengan", "untuk", "pada", "ini", "itu", "ada", "bulan", "tahun", "selama", "antara", "penulis", "bahasa", "penjualan"}
 _ASCENDING_WORDS = ("terkecil", "terendah", "terbawah", "minimal", "paling sedikit", "sedikit", "tersedikit")
+def _vector_titles(message: str) -> list[str]:
+    if not settings.vector_enabled:
+        return []
+    from .vector import search
+    titles: list[str] = []
+    for hit in search(message, limit=8):
+        title = str((hit.get("metadata") or {}).get("judul_buku") or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    return titles
+
 def _search(message: str):
+    """Hybrid retrieval: keyword SQL LIKE + semantic vector search.
+
+    Mengembalikan (rows, stats, per_genre, per_penulis, ascending, mode)
+    di mana mode salah satu dari "keyword" | "vector" | "generic" | "none".
+    """
     connection = connect()
     try:
         lower = message.lower()
@@ -79,44 +98,103 @@ def _search(message: str):
         for term in terms[:8]:
             clauses.append("(lower(judul_buku) LIKE ? OR lower(genre) LIKE ? OR lower(penulis) LIKE ? OR lower(bahasa) LIKE ?)")
             params.extend([f"%{term}%"] * 4)
-        where = " OR ".join(clauses) if clauses else None
+        kw_where = " OR ".join(clauses) if clauses else None
+        kw_param_count = len(params)
+
+        titles = _vector_titles(message)
+        parts = []
+        if kw_where:
+            parts.append(f"({kw_where})")
+        if titles:
+            parts.append(f"judul_buku IN ({','.join('?' * len(titles))})")
+            params = params + titles
+        where = " OR ".join(parts) if parts else None
+
         stats = dict(connection.execute("SELECT COUNT(*) total_buku, COALESCE(SUM(penjualan_juta),0) total_penjualan_juta, COALESCE(AVG(penjualan_juta),0) rata_rata FROM books").fetchone())
+
+        keyword_hit = False
+        if kw_where:
+            keyword_hit = connection.execute(f"SELECT 1 FROM books WHERE {kw_where} LIMIT 1", params[:kw_param_count]).fetchone() is not None
+
         if where:
             rows = connection.execute(f"SELECT * FROM books WHERE {where} ORDER BY penjualan_juta {order} LIMIT 20", params).fetchall()
             per_genre = connection.execute(f"SELECT genre, SUM(penjualan_juta) penjualan, COUNT(*) total_buku FROM books WHERE {where} GROUP BY genre ORDER BY penjualan {order}", params).fetchall()
         else:
+            rows, per_genre = [], []
+
+        if keyword_hit and rows:
+            mode = "keyword"
+        elif rows:
+            mode = "vector"
+        elif where is None:
+            mode = "generic"
             rows = connection.execute(f"SELECT * FROM books ORDER BY penjualan_juta {order} LIMIT 20").fetchall()
             per_genre = connection.execute(f"SELECT genre, SUM(penjualan_juta) penjualan, COUNT(*) total_buku FROM books GROUP BY genre ORDER BY penjualan {order}").fetchall()
-        if not rows and stats["total_buku"] > 0:
-            rows = connection.execute(f"SELECT * FROM books ORDER BY penjualan_juta {order} LIMIT 20").fetchall()
-            per_genre = connection.execute(f"SELECT genre, SUM(penjualan_juta) penjualan, COUNT(*) total_buku FROM books GROUP BY genre ORDER BY penjualan {order}").fetchall()
-        per_penulis = connection.execute(f"SELECT penulis, SUM(penjualan_juta) penjualan, COUNT(*) total_buku FROM books GROUP BY penulis ORDER BY penjualan {order} LIMIT 10").fetchall()
-        return rows, stats, [dict(row) for row in per_genre], [dict(row) for row in per_penulis], ascending
-    finally: connection.close()
+        else:
+            mode = "none"
 
-def _fallback(stats):
-    return {"narration": f"**Total penjualan tercatat {stats['total_penjualan_juta']:g} juta untuk {stats['total_buku']} buku.**\n\nRata-rata penjualan per buku {stats['rata_rata']:g} juta.", "chart": None, "recommendation": "Gunakan pertanyaan yang lebih spesifik untuk menemukan buku atau genre unggulan.", "mode": "local-fallback"}
+        per_penulis = connection.execute(f"SELECT penulis, SUM(penjualan_juta) penjualan, COUNT(*) total_buku FROM books GROUP BY penulis ORDER BY penjualan {order} LIMIT 10").fetchall() if rows else []
+        return rows, stats, [dict(row) for row in per_genre], [dict(row) for row in per_penulis], ascending, mode
+    finally:
+        connection.close()
 
-def _ask_deepseek(question: str, context: str, stats: dict):
+def _valid_chart(chart) -> bool:
+    if not isinstance(chart, dict):
+        return False
+    if chart.get("type") not in {"bar", "line", "pie"}:
+        return False
+    labels = chart.get("labels")
+    datasets = chart.get("datasets")
+    if not isinstance(labels, list) or not labels:
+        return False
+    if not isinstance(datasets, list) or not datasets:
+        return False
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            return False
+        data = dataset.get("data")
+        if not isinstance(data, list) or len(data) != len(labels):
+            return False
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 for value in data):
+            return False
+    return True
+
+def _ask_deepseek(question: str, context: str, stats: dict, history: list[dict] | None = None):
     if not settings.deepseek_api_key:
         return None
     try:
         from openai import OpenAI
         client = OpenAI(api_key=settings.deepseek_api_key, base_url="https://api.deepseek.com")
-        response = client.chat.completions.create(model=settings.deepseek_model, messages=[{"role": "user", "content": build_prompt(question, context, stats)}], response_format={"type": "json_object"}, timeout=60)
+        response = client.chat.completions.create(model=settings.deepseek_model, messages=[{"role": "user", "content": build_prompt(question, context, stats, history)}], response_format={"type": "json_object"}, timeout=60)
         result = json.loads(response.choices[0].message.content or "{}")
         chart = result.get("chart")
-        if chart is not None and (chart.get("type") not in {"bar", "line", "pie"} or len(chart.get("labels", [])) != len(chart.get("datasets", [{}])[0].get("data", []))):
+        if chart is not None and not _valid_chart(chart):
+            logger.warning("Chart dari LLM tidak valid, dibuang: %s", chart)
             chart = None
         return {"narration": str(result.get("narration", "")), "chart": chart, "recommendation": result.get("recommendation"), "mode": "deepseek"}
-    except Exception:
+    except Exception as exc:
+        logger.warning("Panggilan DeepSeek gagal, pakai fallback lokal: %s", exc)
         return None
+
+def _fallback(stats):
+    return {"narration": f"**Total penjualan tercatat {stats['total_penjualan_juta']:g} juta untuk {stats['total_buku']} buku.**\n\nRata-rata penjualan per buku {stats['rata_rata']:g} juta.", "chart": None, "recommendation": "Gunakan pertanyaan yang lebih spesifik untuk menemukan buku atau genre unggulan.", "mode": "local-fallback"}
+
+_SESSION_TTL = timedelta(hours=1)
+
+def _session_history(session_id: str) -> list[dict]:
+    entry = SESSIONS.get(session_id)
+    if not entry or datetime.now(timezone.utc) - entry[0] > _SESSION_TTL:
+        return []
+    return entry[1]
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
-    rows, stats, per_genre, per_penulis, ascending = _search(request.message)
-    if not rows or stats["total_buku"] == 0:
-        result = {"narration": "Data penjualan tidak cukup untuk menjawab pertanyaan ini. Coba pertanyaan yang lebih spesifik.", "chart": None, "recommendation": None, "mode": "empty"}
+    history = _session_history(request.session_id)
+    rows, stats, per_genre, per_penulis, ascending, mode = _search(request.message)
+    if stats["total_buku"] == 0:
+        result = {"narration": "Belum ada data penjualan. Unggah file CSV terlebih dahulu.", "chart": None, "recommendation": None, "mode": "empty", "sources": []}
+    elif mode == "none":
+        result = {"narration": "Tidak ditemukan data yang cocok dengan kata kunci pada pertanyaan ini. Coba sebutkan judul buku, penulis, atau genre yang ada di data.", "chart": None, "recommendation": None, "mode": "no-match", "sources": []}
     else:
         context = "\n".join(f"{row['judul_buku']} — {row['penulis']} — {row['genre']} — bahasa {row['bahasa']} — tahun {row['tahun']} — penjualan {row['penjualan_juta']:g} juta" for row in rows)
         if per_genre:
@@ -126,15 +204,14 @@ def chat(request: ChatRequest):
             label = "TERKECIL" if ascending else "TERBESAR"
             summary_penulis = "\n".join(f"{p['penulis']}: {p['penjualan']:g} juta dari {p['total_buku']} buku" for p in per_penulis)
             context += f"\n\nRINGKASAN PER PENULIS ({label}):\n{summary_penulis}"
-        result = _ask_deepseek(request.message, context, stats) or _fallback(stats)
-        if request.session_id not in SESSIONS or datetime.now(timezone.utc) - SESSIONS[request.session_id][0] > timedelta(hours=1): SESSIONS[request.session_id] = (datetime.now(timezone.utc), [])
-        SESSIONS[request.session_id][1].append({"role": "user", "content": request.message})
+        result = _ask_deepseek(request.message, context, stats, history) or _fallback(stats)
         result["sources"] = [str(row["judul_buku"]) for row in rows]
-    if "sources" not in result: result["sources"] = []
+    SESSIONS[request.session_id] = (datetime.now(timezone.utc), history + [
+        {"role": "user", "content": request.message},
+        {"role": "assistant", "content": str(result["narration"])[:600]},
+    ])
     return result
 
 @router.get("/sessions/{session_id}/history")
 def history(session_id: str):
-    session = SESSIONS.get(session_id)
-    if not session or datetime.now(timezone.utc) - session[0] > timedelta(hours=1): return []
-    return session[1]
+    return _session_history(session_id)

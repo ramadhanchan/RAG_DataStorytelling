@@ -5,5 +5,7 @@ node_modules/
 dist/
 .env
 *.db
+!data/sales.db
 data/chroma/
 .commandcode/
+docs/superpowers/
